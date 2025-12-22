@@ -1,0 +1,143 @@
+cat > alert_bot.py <<'PY'
+import time
+import joblib
+from datetime import datetime, timezone, timedelta
+
+from pionex_client import PionexClient
+from features import compute_features
+from hyperliquid_client import HyperliquidClient
+
+
+# =====================
+# CONFIG
+# =====================
+SYMBOL_PIONEX = "TAO_USDT_PERP"
+INTERVAL_PIONEX = "5M"
+LOOKBACK = 120
+
+SYMBOL_HL = "TAO"
+LEVERAGE = 5              # isolé x5
+MARGIN_USDC = 2.4         # marge souhaitée (~2.4 USDC)
+NOTIONAL_USDC = MARGIN_USDC * LEVERAGE  # notional => ~12 USDC (>= 10 après arrondi)
+
+TP_PCT = 0.01
+SL_PCT = 0.002
+MAX_HOLD_MIN = 25
+
+THRESHOLD = 0.70          # remets 0.70 en normal
+
+
+# =====================
+# INIT
+# =====================
+client = PionexClient()
+hl = HyperliquidClient(slippage=0.01, skip_ws=True)
+
+model = joblib.load("tao_lgbm_model.joblib")
+
+# set leverage isolé
+try:
+    resp = hl.set_isolated_leverage(SYMBOL_HL, LEVERAGE)
+    print(f"✅ Leverage isolé set: {SYMBOL_HL} x{LEVERAGE}")
+except Exception as e:
+    print("⚠️ Leverage non set:", e)
+
+print("🚀 Alert bot Hyperliquid lancé (ML → entrée → TP/SL → time-exit)")
+
+last_bar = None
+position_open_time = None
+
+pending_entry = False
+pending_since = None
+
+
+# =====================
+# LOOP
+# =====================
+while True:
+    try:
+        df = client.get_klines(SYMBOL_PIONEX, interval=INTERVAL_PIONEX, limit=LOOKBACK)
+
+        if df is None or len(df) < 30:
+            print("⚠️ Pas assez de données OHLC")
+            time.sleep(5)
+            continue
+
+        # IMPORTANT: on ignore la dernière bougie (souvent en cours)
+        df_closed = df.iloc[:-1].copy()
+        bar_ts = df_closed.iloc[-1]["timestamp"]
+        close_px = float(df_closed.iloc[-1]["close"])
+
+        # On ne calcule qu'à chaque nouvelle bougie close
+        if last_bar is not None and bar_ts == last_bar:
+            # si on attend la position, on check quand même
+            pass
+        else:
+            last_bar = bar_ts
+
+        feat = compute_features(df_closed)
+        if feat is None or len(feat) == 0:
+            print("⚠️ Features vides")
+            time.sleep(5)
+            continue
+
+        X = feat.iloc[-1:][model.feature_name_]
+        proba = float(model.predict_proba(X)[0][1])
+
+        now = datetime.now(timezone.utc)
+        print(f"{now} | Proba ML: {proba:.4f} | close={close_px:.4f} | bar={bar_ts}")
+
+        # 1) état position
+        in_pos, pos = hl.has_position(SYMBOL_HL)
+
+        # 2) si une position vient d'être fermée (TP/SL ou manuel)
+        if (not in_pos) and position_open_time is not None:
+            position_open_time = None
+            pending_entry = False
+            pending_since = None
+
+        # 3) pending: on a envoyé l'ordre mais la position n'est pas encore visible
+        if pending_entry and not in_pos:
+            # timeout de pending (évite spam d'ordres)
+            if pending_since and (now - pending_since) > timedelta(seconds=30):
+                print("⚠️ Pending trop long -> reset pending")
+                pending_entry = False
+                pending_since = None
+            else:
+                # on re-check rapidement si la position apparaît
+                pos2 = hl.wait_for_position(SYMBOL_HL, timeout_sec=5, poll_sec=1.0)
+                if pos2 is not None:
+                    in_pos = True
+                    pos = pos2
+                    position_open_time = pending_since or now
+                    pending_entry = False
+                    pending_since = None
+
+                    # place TP/SL dès que la position est détectée
+                    hl.set_tp_sl_for_position(SYMBOL_HL, tp_pct=TP_PCT, sl_pct=SL_PCT)
+
+        # 4) ENTRY (seulement si pas de position ET pas pending)
+        if (proba >= THRESHOLD) and (not in_pos) and (not pending_entry):
+            print("📈 SIGNAL LONG -> ouverture")
+            resp = hl.open_long(SYMBOL_HL, notional_usdc=NOTIONAL_USDC)
+            print("✅ order resp:", resp)
+
+            pending_entry = True
+            pending_since = now
+
+        # 5) TIME EXIT (25 min)
+        if in_pos and position_open_time is not None:
+            if now - position_open_time >= timedelta(minutes=MAX_HOLD_MIN):
+                print("⏱ TIME EXIT -> fermeture marché")
+                resp = hl.close_position(SYMBOL_HL)
+                print("✅ close resp:", resp)
+                position_open_time = None
+                pending_entry = False
+                pending_since = None
+
+        time.sleep(5)
+
+    except Exception as e:
+        print("❌ ERROR:", e)
+        time.sleep(5)
+PY
