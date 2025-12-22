@@ -7,6 +7,15 @@ from pionex_client import PionexClient
 from features import compute_features
 from hyperliquid_client import HyperliquidClient
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # Charge le fichier .env situé dans le même dossier
+
+HYPER_API_KEY = os.getenv("HYPERLIQUID_API_KEY")
+HYPER_SECRET = os.getenv("HYPERLIQUID_SECRET_KEY")
+PIONEX_API_KEY = os.getenv("PIONEX_API_KEY")
+PIONEX_SECRET_KEY = os.getenv("PIONEX_SECRET_KEY")
 
 # =====================
 # CONFIG
