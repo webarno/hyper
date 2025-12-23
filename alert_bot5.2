@@ -32,7 +32,7 @@ THRESHOLD = 0.70          # remets 0.70 en normal
 client = PionexClient()
 hl = HyperliquidClient(slippage=0.01, skip_ws=True)
 
-model = joblib.load("tao_lgbm_model.joblib")
+model = joblib.load("tao_lgbm_model_v3.joblib")
 
 # set leverage isolé
 try:
